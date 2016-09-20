@@ -16,6 +16,7 @@ package local
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -34,6 +35,8 @@ import (
 	"github.com/prometheus/prometheus/storage/local/codable"
 	"github.com/prometheus/prometheus/storage/local/index"
 	"github.com/prometheus/prometheus/util/flock"
+
+	"github.com/edsrzf/mmap-go"
 )
 
 const (
@@ -47,6 +50,7 @@ const (
 	seriesDirNameLen     = 2 // How many bytes of the fingerprint in dir name.
 	hintFileSuffix       = ".hint"
 
+	chunksFileName        = "chunks.db"
 	mappingsFileName      = "mappings.db"
 	mappingsTempFileName  = "mappings.db.tmp"
 	mappingsFormatVersion = 1
@@ -68,6 +72,14 @@ const (
 	indexingMaxBatchSize  = 1024 * 1024
 	indexingBatchTimeout  = 500 * time.Millisecond // Commit batch when idle for that long.
 	indexingQueueCapacity = 1024 * 16
+
+	// Commit batch when idle for that long.  Beware that since submitters to the queue are holding
+	// an fp lock, increasing this will increase contention overall.  It's debatable whether there's
+	// even any value in batching here, I just copied the existing indexer wholesale.
+	chunkIndexingBatchTimeout = 1 * time.Millisecond
+
+	chunksPerExtent = 31
+	extentSize      = chunksPerExtent * chunkLenWithHeader
 )
 
 var fpLen = len(model.Fingerprint(0).String()) // Length of a fingerprint as string.
@@ -92,6 +104,13 @@ type indexingOp struct {
 	opType      indexingOpType
 }
 
+type chunkIndexingOp struct {
+	fingerprint model.Fingerprint
+	opType      indexingOpType
+	numChunks   int
+	extents     chan []int
+}
+
 // A Persistence is used by a Storage implementation to store samples
 // persistently across restarts. The methods are only goroutine-safe if
 // explicitly marked as such below. The chunk-related methods persistChunks,
@@ -104,18 +123,28 @@ type persistence struct {
 	archivedFingerprintToTimeRange *index.FingerprintTimeRangeIndex
 	labelPairToFingerprints        *index.LabelPairFingerprintIndex
 	labelNameToLabelValues         *index.LabelNameLabelValuesIndex
+	fingerprintToChunkIdxs         *index.FingerprintChunkIdxIndex
 
 	indexingQueue   chan indexingOp
 	indexingStopped chan struct{}
 	indexingFlush   chan chan int
 
-	indexingQueueLength   prometheus.Gauge
-	indexingQueueCapacity prometheus.Metric
-	indexingBatchSizes    prometheus.Summary
-	indexingBatchDuration prometheus.Summary
-	checkpointDuration    prometheus.Gauge
-	dirtyCounter          prometheus.Counter
-	startedDirty          prometheus.Gauge
+	chunkIndexingQueue   chan chunkIndexingOp
+	chunkIndexingStopped chan struct{}
+	chunkIndexingFlush   chan chan int
+
+	indexingQueueLength        prometheus.Gauge
+	indexingQueueCapacity      prometheus.Metric
+	indexingBatchSizes         prometheus.Summary
+	indexingBatchDuration      prometheus.Summary
+	chunkIndexingQueueLength   prometheus.Gauge
+	chunkIndexingQueueCapacity prometheus.Metric
+	chunkIndexingBatchSizes    prometheus.Summary
+	chunkIndexingBatchDuration prometheus.Summary
+	checkpointDuration         prometheus.Gauge
+	dirtyCounter               prometheus.Counter
+	startedDirty               prometheus.Gauge
+	chunkIndexingGetDuration   prometheus.Summary
 
 	dirtyMtx       sync.Mutex     // Protects dirty and becameDirty.
 	dirty          bool           // true if persistence was started in dirty state.
@@ -129,6 +158,93 @@ type persistence struct {
 	minShrinkRatio float64 // How much a series file has to shrink to justify dropping chunks.
 
 	bufPool sync.Pool
+
+	extentSource chan int
+	chunks       mmap.MMap
+}
+
+type ChunkReader interface {
+	GetChunkWithHeader(idx int) ([]byte, error)
+	Close() error
+	Len() (int, error)
+}
+
+type globalChunkReader struct {
+	data []byte
+}
+
+func (cr globalChunkReader) Close() error {
+	return nil
+}
+
+func (cr globalChunkReader) Len() (int, error) {
+	// TODO we overstate the size in the partially full extent case
+	return len(cr.data) / chunkLenWithHeader, nil
+}
+
+func (cr globalChunkReader) GetChunkWithHeader(idx int) ([]byte, error) {
+	if cr.data == nil {
+		return nil, fmt.Errorf("cr: closed")
+	}
+	if idx < 0 {
+		return nil, fmt.Errorf("cr: invalid index %d", idx)
+	}
+	start := chunkLenWithHeader * idx
+	return cr.data[start : start+chunkLenWithHeader], nil
+}
+
+type chunkReader struct {
+	globalChunkReader
+	extents []int
+}
+
+func newChunkReader(data []byte, extents []int) *chunkReader {
+	return &chunkReader{globalChunkReader{data}, extents}
+}
+
+func (cr chunkReader) Len() (int, error) {
+	off := (len(cr.extents) - 1) * chunksPerExtent
+	used := off
+	for i := 0; i < chunksPerExtent; i++ {
+		cd, err := loadChunkDesc(cr, off+i)
+		if err != nil {
+			return -1, err
+		}
+		if cd.chunkFirstTime != model.Time(0) {
+			used++
+		} else {
+			break
+		}
+	}
+	return used, nil
+}
+
+// GetChunkWithHeader return the idx'th chunk for a series, including header.
+func (cr chunkReader) GetChunkWithHeader(idx int) ([]byte, error) {
+	if cr.extents == nil {
+		return nil, errors.New("cr: closed")
+	}
+	exidx, exoff := idx/chunksPerExtent, idx%chunksPerExtent
+	if exidx >= len(cr.extents) {
+		return nil, fmt.Errorf("cr: invalid index %d", idx)
+	}
+	return cr.globalChunkReader.GetChunkWithHeader(cr.extents[exidx] + exoff)
+}
+
+func (cr chunkReader) String() string {
+	return fmt.Sprintf("chunkReader(%v)", cr.extents)
+}
+
+type fileWrapper struct {
+	*os.File
+}
+
+func (fw fileWrapper) Len() int {
+	fi, err := fw.Stat()
+	if err == nil {
+		return int(fi.Size())
+	}
+	return 0
 }
 
 // newPersistence returns a newly allocated persistence backed by local disk storage, ready to use.
@@ -192,16 +308,25 @@ func newPersistence(
 	if err != nil {
 		return nil, err
 	}
+	fingerprintToChunkIdxs, err := index.NewFingerprintChunkIdxIndex(basePath)
+	if err != nil {
+		return nil, err
+	}
 
 	p := &persistence{
 		basePath: basePath,
 
 		archivedFingerprintToMetrics:   archivedFingerprintToMetrics,
 		archivedFingerprintToTimeRange: archivedFingerprintToTimeRange,
+		fingerprintToChunkIdxs:         fingerprintToChunkIdxs,
 
 		indexingQueue:   make(chan indexingOp, indexingQueueCapacity),
 		indexingStopped: make(chan struct{}),
 		indexingFlush:   make(chan chan int),
+
+		chunkIndexingQueue:   make(chan chunkIndexingOp, indexingQueueCapacity),
+		chunkIndexingStopped: make(chan struct{}),
+		chunkIndexingFlush:   make(chan chan int),
 
 		indexingQueueLength: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
@@ -234,6 +359,45 @@ func newPersistence(
 				Help:      "Quantiles for batch indexing duration in seconds.",
 			},
 		),
+		chunkIndexingQueueLength: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      "chunk_indexing_queue_length",
+			Help:      "The number of metrics waiting to be indexed.",
+		}),
+		chunkIndexingQueueCapacity: prometheus.MustNewConstMetric(
+			prometheus.NewDesc(
+				prometheus.BuildFQName(namespace, subsystem, "chunk_indexing_queue_capacity"),
+				"The capacity of the chunkIndexing queue.",
+				nil, nil,
+			),
+			prometheus.GaugeValue,
+			float64(indexingQueueCapacity),
+		),
+		chunkIndexingBatchSizes: prometheus.NewSummary(
+			prometheus.SummaryOpts{
+				Namespace: namespace,
+				Subsystem: subsystem,
+				Name:      "chunk_indexing_batch_sizes",
+				Help:      "Quantiles for indexing batch sizes (number of metrics per batch).",
+			},
+		),
+		chunkIndexingBatchDuration: prometheus.NewSummary(
+			prometheus.SummaryOpts{
+				Namespace: namespace,
+				Subsystem: subsystem,
+				Name:      "chunk_indexing_batch_duration_seconds",
+				Help:      "Quantiles for batch indexing duration in seconds.",
+			},
+		),
+		chunkIndexingGetDuration: prometheus.NewSummary(
+			prometheus.SummaryOpts{
+				Namespace: namespace,
+				Subsystem: subsystem,
+				Name:      "chunk_indexing_get_duration_seconds",
+				Help:      "Quantiles for chunk indexing Get duration in seconds.",
+			},
+		),
 		checkpointDuration: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: subsystem,
@@ -260,7 +424,8 @@ func newPersistence(
 		// Create buffers of length 3*chunkLenWithHeader by default because that is still reasonably small
 		// and at the same time enough for many uses. The contract is to never return buffer smaller than
 		// that to the pool so that callers can rely on a minimum buffer size.
-		bufPool: sync.Pool{New: func() interface{} { return make([]byte, 0, 3*chunkLenWithHeader) }},
+		bufPool:      sync.Pool{New: func() interface{} { return make([]byte, 0, 3*chunkLenWithHeader) }},
+		extentSource: make(chan int),
 	}
 
 	if p.dirty {
@@ -283,10 +448,67 @@ func newPersistence(
 	p.labelPairToFingerprints = labelPairToFingerprints
 	p.labelNameToLabelValues = labelNameToLabelValues
 
+	chunksPath := filepath.Join(p.basePath, chunksFileName)
+	fw, fr, chunks, err := getChunksFile(chunksPath)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := fw.Stat()
+	if err != nil {
+		return nil, err
+	}
+	p.chunks = chunks
+
+	go func() {
+		defer fr.Close()
+		defer fw.Close()
+
+		// TODO we should be growing the file on demand
+		nextExtent := int(fi.Size() / chunkLenWithHeader)
+
+		buf := make([]byte, chunksPerExtent*chunkLenWithHeader)
+		for {
+			_, err := fw.Write(buf)
+			if err != nil {
+				panic("unable to extent chunks file")
+			}
+
+			p.extentSource <- nextExtent
+			nextExtent += chunksPerExtent
+		}
+
+	}()
+
 	return p, nil
 }
 
+func getChunksFile(filename string) (fw *os.File, fr *os.File, chunkmap mmap.MMap, err error) {
+	// TODO(ncabatoff) allow for multiple chunks files since 32bit systems can only map 2GB per mapping
+	mapsize := 2 * 1024 * 1024 * 1024
+	fr, err = os.Open(filename)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return
+		}
+
+		if fw, err = os.Create(filename); err != nil {
+			return
+		}
+
+		// We want a readonly filehandle to back the mmap, to make sure we don't write to it
+		fr, err = os.Open(filename)
+		if err != nil {
+			return
+		}
+	} else {
+		fw, err = os.OpenFile(filename, os.O_WRONLY|os.O_APPEND, 0640)
+	}
+	chunkmap, err = mmap.MapRegion(fr, mapsize, mmap.RDONLY, 0, 0)
+	return
+}
+
 func (p *persistence) run() {
+	go p.processChunkIndexingQueue()
 	p.processIndexingQueue()
 }
 
@@ -296,6 +518,11 @@ func (p *persistence) Describe(ch chan<- *prometheus.Desc) {
 	ch <- p.indexingQueueCapacity.Desc()
 	p.indexingBatchSizes.Describe(ch)
 	p.indexingBatchDuration.Describe(ch)
+	ch <- p.chunkIndexingQueueLength.Desc()
+	ch <- p.chunkIndexingQueueCapacity.Desc()
+	p.chunkIndexingBatchSizes.Describe(ch)
+	p.chunkIndexingBatchDuration.Describe(ch)
+	p.chunkIndexingGetDuration.Describe(ch)
 	ch <- p.checkpointDuration.Desc()
 	ch <- p.dirtyCounter.Desc()
 	ch <- p.startedDirty.Desc()
@@ -304,11 +531,17 @@ func (p *persistence) Describe(ch chan<- *prometheus.Desc) {
 // Collect implements prometheus.Collector.
 func (p *persistence) Collect(ch chan<- prometheus.Metric) {
 	p.indexingQueueLength.Set(float64(len(p.indexingQueue)))
+	p.chunkIndexingQueueLength.Set(float64(len(p.chunkIndexingQueue)))
 
 	ch <- p.indexingQueueLength
 	ch <- p.indexingQueueCapacity
 	p.indexingBatchSizes.Collect(ch)
 	p.indexingBatchDuration.Collect(ch)
+	ch <- p.chunkIndexingQueueLength
+	ch <- p.chunkIndexingQueueCapacity
+	p.chunkIndexingBatchSizes.Collect(ch)
+	p.chunkIndexingBatchDuration.Collect(ch)
+	p.chunkIndexingGetDuration.Collect(ch)
 	ch <- p.checkpointDuration
 	ch <- p.dirtyCounter
 	ch <- p.startedDirty
@@ -364,34 +597,91 @@ func (p *persistence) labelValuesForLabelName(ln model.LabelName) (model.LabelVa
 // persistChunks persists a number of consecutive chunks of a series. It is the
 // caller's responsibility to not modify the chunks concurrently and to not
 // persist or drop anything for the same fingerprint concurrently. It returns
-// the (zero-based) index of the first persisted chunk within the series
-// file. In case of an error, the returned index is -1 (to avoid the
-// misconception that the chunk was written at position 0).
+// the (zero-based) index of the first persisted chunk.  In case of an error,
+// the returned index is -1 (to avoid the misconception that the chunk was
+// written at position 0).
 //
 // Returning an error signals problems with the series file. In this case, the
 // caller should quarantine the series.
-func (p *persistence) persistChunks(fp model.Fingerprint, chunks []chunk) (index int, err error) {
+func (p *persistence) persistChunks(fp model.Fingerprint, chunkDescs []*chunkDesc) (index int, err error) {
 	f, err := p.openChunkFileForWriting(fp)
 	if err != nil {
 		return -1, err
 	}
 	defer p.closeChunkFile(f)
 
-	if err := p.writeChunks(f, chunks); err != nil {
-		return -1, err
-	}
-
-	// Determine index within the file.
-	offset, err := f.Seek(0, os.SEEK_CUR)
-	if err != nil {
-		return -1, err
-	}
-	index, err = chunkIndexForOffset(offset)
+	begin := time.Now()
+	idxs, ok, err := p.fingerprintToChunkIdxs.Lookup(fp)
+	p.chunkIndexingGetDuration.Observe(time.Since(begin).Seconds())
 	if err != nil {
 		return -1, err
 	}
 
-	return index - len(chunks), err
+	// How many chunks used in current extent
+	used := 0
+
+	// If there are multiple extents, adjust the index we'll return such that it's the
+	// index across all chunks for the series.
+	startidx := chunksPerExtent * (len(idxs) - 1)
+
+	// writeidxs is the list of extents we'll write to
+	var writeidxs []int
+	needed := len(chunkDescs)
+	if ok {
+		// Scan through the last extent looking for the first zero page.
+		cr := newChunkReader(p.chunks, idxs[len(idxs)-1:])
+		used, err := cr.Len()
+		if err != nil {
+			return -1, err
+		}
+
+		startidx += used
+		if used < chunksPerExtent {
+			// If there's still space in the current extent, start by filling it
+			writeidxs = append(writeidxs, idxs[len(idxs)-1])
+			avail := chunksPerExtent - used
+			needed -= avail
+		} else {
+			used = 0
+		}
+	}
+
+	writeidxs = append(writeidxs, p.chunkIndexFp(fp, needed)...)
+
+	for len(chunkDescs) > 0 {
+		startoffset := int64((writeidxs[0] + used) * chunkLenWithHeader)
+		// TODO(ncabatoff) remove redundant seek when consecutive
+		_, err := f.Seek(startoffset, os.SEEK_SET)
+		if err != nil {
+			return -1, err
+		}
+
+		numchunks := chunksPerExtent - used
+		if numchunks > len(chunkDescs) {
+			numchunks = len(chunkDescs)
+		}
+		chunks := make([]chunk, numchunks)
+		for i, cd := range chunkDescs[:numchunks] {
+			chunks[i] = cd.c
+		}
+		if err := p.writeChunks(f, chunks); err != nil {
+			return -1, err
+		}
+
+		// Now rebuild the chunks, but backed by the mmap
+		cr := newChunkReader(p.chunks, writeidxs[:1])
+		for i := range chunks {
+			chunkDescs[i].c, err = loadChunk(cr, i)
+			if err != nil {
+				break
+			}
+		}
+
+		chunkDescs, writeidxs = chunkDescs[numchunks:], writeidxs[1:]
+		used = 0
+	}
+
+	return startidx, err
 }
 
 // loadChunks loads a group of chunks of a timeseries by their index. The chunk
@@ -399,56 +689,42 @@ func (p *persistence) persistChunks(fp model.Fingerprint, chunks []chunk) (index
 // incrementally larger indexes. The indexOffset denotes the offset to be added to
 // each index in indexes. It is the caller's responsibility to not persist or
 // drop anything for the same fingerprint concurrently.
-func (p *persistence) loadChunks(fp model.Fingerprint, indexes []int, indexOffset int) ([]chunk, error) {
+func (p *persistence) loadChunks(fp model.Fingerprint, startIdx, endIdx int) ([]chunk, error) {
 	f, err := p.openChunkFileForReading(fp)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
-	chunks := make([]chunk, 0, len(indexes))
-	buf := p.bufPool.Get().([]byte)
-	defer func() {
-		// buf may change below. An unwrapped 'defer p.bufPool.Put(buf)'
-		// would only put back the original buf.
-		p.bufPool.Put(buf)
-	}()
+	chunks := make([]chunk, 0, endIdx-startIdx)
 
-	for i := 0; i < len(indexes); i++ {
-		// This loads chunks in batches. A batch is a streak of
-		// consecutive chunks, read from disk in one go.
-		batchSize := 1
-		if _, err := f.Seek(offsetForChunkIndex(indexes[i]+indexOffset), os.SEEK_SET); err != nil {
-			return nil, err
+	for idx := startIdx; idx < endIdx; idx++ {
+		chunk, err := loadChunk(f, idx)
+		if err != nil {
+			return nil, fmt.Errorf("can't load chunk %d from %v: %v", idx, f, err)
 		}
-
-		for ; batchSize < chunkMaxBatchSize &&
-			i+1 < len(indexes) &&
-			indexes[i]+1 == indexes[i+1]; i, batchSize = i+1, batchSize+1 {
-		}
-		readSize := batchSize * chunkLenWithHeader
-		if cap(buf) < readSize {
-			buf = make([]byte, readSize)
-		}
-		buf = buf[:readSize]
-
-		if _, err := io.ReadFull(f, buf); err != nil {
-			return nil, err
-		}
-		for c := 0; c < batchSize; c++ {
-			chunk, err := newChunkForEncoding(chunkEncoding(buf[c*chunkLenWithHeader+chunkHeaderTypeOffset]))
-			if err != nil {
-				return nil, err
-			}
-			if err := chunk.unmarshalFromBuf(buf[c*chunkLenWithHeader+chunkHeaderLen:]); err != nil {
-				return nil, err
-			}
-			chunks = append(chunks, chunk)
-		}
+		chunks = append(chunks, chunk)
 	}
+
 	chunkOps.WithLabelValues(load).Add(float64(len(chunks)))
 	atomic.AddInt64(&numMemChunks, int64(len(chunks)))
 	return chunks, nil
+}
+
+func loadChunk(cr ChunkReader, index int) (chunk, error) {
+	buf, err := cr.GetChunkWithHeader(index)
+	if err != nil {
+		return nil, err
+	}
+
+	chunk, err := newChunkForEncoding(chunkEncoding(buf[chunkHeaderTypeOffset]))
+	if err != nil {
+		return nil, err
+	}
+
+	if err := chunk.unmarshalFromBuf(buf[chunkHeaderLen:]); err != nil {
+		return nil, err
+	}
+	return chunk, nil
 }
 
 // loadChunkDescs loads the chunkDescs for a series from disk. offsetFromEnd is
@@ -456,48 +732,45 @@ func (p *persistence) loadChunks(fp model.Fingerprint, indexes []int, indexOffse
 // caller's responsibility to not persist or drop anything for the same
 // fingerprint concurrently.
 func (p *persistence) loadChunkDescs(fp model.Fingerprint, offsetFromEnd int) ([]*chunkDesc, error) {
-	f, err := p.openChunkFileForReading(fp)
+	cr, err := p.openChunkFileForReading(fp)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
-	fi, err := f.Stat()
+	numChunks, err := cr.Len()
 	if err != nil {
 		return nil, err
 	}
-	if fi.Size()%int64(chunkLenWithHeader) != 0 {
-		// The returned error will bubble up and lead to quarantining of the whole series.
-		return nil, fmt.Errorf(
-			"size of series file for fingerprint %v is %d, which is not a multiple of the chunk length %d",
-			fp, fi.Size(), chunkLenWithHeader,
-		)
-	}
-
-	numChunks := int(fi.Size())/chunkLenWithHeader - offsetFromEnd
+	numChunks -= offsetFromEnd
 	cds := make([]*chunkDesc, numChunks)
-	chunkTimesBuf := make([]byte, 16)
 	for i := 0; i < numChunks; i++ {
-		_, err := f.Seek(offsetForChunkIndex(i)+chunkHeaderFirstTimeOffset, os.SEEK_SET)
+		cd, err := loadChunkDesc(cr, i)
 		if err != nil {
 			return nil, err
 		}
-
-		_, err = io.ReadAtLeast(f, chunkTimesBuf, 16)
-		if err != nil {
-			return nil, err
+		if cd.chunkFirstTime == model.Time(0) {
+			break
 		}
-		cds[i] = &chunkDesc{
-			chunkFirstTime: model.Time(binary.LittleEndian.Uint64(chunkTimesBuf)),
-			chunkLastTime:  model.Time(binary.LittleEndian.Uint64(chunkTimesBuf[8:])),
-		}
+		cds[i] = cd
 	}
 	chunkDescOps.WithLabelValues(load).Add(float64(len(cds)))
 	numMemChunkDescs.Add(float64(len(cds)))
 	return cds, nil
+}
+
+func loadChunkDesc(cr ChunkReader, index int) (*chunkDesc, error) {
+	chunkbytes, err := cr.GetChunkWithHeader(index)
+	if err != nil {
+		return nil, err
+	}
+	chunkTimesBuf := chunkbytes[chunkHeaderFirstTimeOffset:]
+	return &chunkDesc{
+		chunkFirstTime: model.Time(binary.LittleEndian.Uint64(chunkTimesBuf)),
+		chunkLastTime:  model.Time(binary.LittleEndian.Uint64(chunkTimesBuf[8:])),
+	}, nil
 }
 
 // checkpointSeriesMapAndHeads persists the fingerprint to memory-series mapping
@@ -738,6 +1011,7 @@ func (p *persistence) loadSeriesMapAndHeads() (sm *seriesMap, chunksToPersist in
 	return sm, hs.chunksToPersistTotal, nil
 }
 
+// TODO(ncabatoff-later)
 // dropAndPersistChunks deletes all chunks from a series file whose last sample
 // time is before beforeTime, and then appends the provided chunks, leaving out
 // those whose last sample time is before beforeTime. It returns the timestamp
@@ -759,158 +1033,149 @@ func (p *persistence) dropAndPersistChunks(
 	allDropped bool,
 	err error,
 ) {
-	// Style note: With the many return values, it was decided to use naked
-	// returns in this method. They make the method more readable, but
-	// please handle with care!
-	if len(chunks) > 0 {
-		// We have chunks to persist. First check if those are already
-		// too old. If that's the case, the chunks in the series file
-		// are all too old, too.
-		i := 0
-		for ; i < len(chunks); i++ {
-			var lt model.Time
-			lt, err = chunks[i].newIterator().lastTimestamp()
+	return
+	/*
+		// Style note: With the many return values, it was decided to use naked
+		// returns in this method. They make the method more readable, but
+		// please handle with care!
+		if len(chunks) > 0 {
+			// We have chunks to persist. First check if those are already
+			// too old. If that's the case, the chunks in the series file
+			// are all too old, too.
+			i := 0
+			for ; i < len(chunks); i++ {
+				var lt model.Time
+				lt, err = chunks[i].newIterator().lastTimestamp()
+				if err != nil {
+					return
+				}
+				if !lt.Before(beforeTime) {
+					break
+				}
+			}
+			if i < len(chunks) {
+				firstTimeNotDropped = chunks[i].firstTime()
+			}
+			if i > 0 || firstTimeNotDropped.Before(beforeTime) {
+				// Series file has to go.
+				if numDropped, err = p.deleteSeriesFile(fp); err != nil {
+					return
+				}
+				numDropped += i
+				if i == len(chunks) {
+					allDropped = true
+					return
+				}
+				// Now simply persist what has to be persisted to a new file.
+				_, err = p.persistChunks(fp, chunks[i:])
+				return
+			}
+		}
+
+		// If we are here, we have to check the series file itself.
+		f, err := p.openChunkFileForReading(fp)
+		if os.IsNotExist(err) {
+			// No series file. Only need to create new file with chunks to
+			// persist, if there are any.
+			if len(chunks) == 0 {
+				allDropped = true
+				err = nil // Do not report not-exist err.
+				return
+			}
+			offset, err = p.persistChunks(fp, chunks)
+			return
+		}
+		if err != nil {
+			return
+		}
+		defer f.Close()
+
+		var cd *chunkDesc
+		var firstTimeInFile model.Time
+		// Find the first chunk in the file that should be kept.
+		var fileoffset int64
+		for ; ; numDropped++ {
+			// if _, err = f.Seek(offset, os.SEEK_SET); err != nil { return }
+			thisoffset := offsetForChunkIndex(numDropped)
+			lcdbuf := make([]byte, 16)
+			cd, err = loadChunkDesc(f, lcdbuf, int(thisoffset))
+			fileoffset = thisoffset + chunkHeaderLen
+			if err == io.EOF {
+				// Close the file before trying to delete it. This is necessary on Windows
+				// (this will cause the defer f.Close to fail, but the error is silently ignored)
+				f.Close()
+				// We ran into the end of the file without finding any chunks that should
+				// be kept. Remove the whole file.
+				if numDropped, err = p.deleteSeriesFile(fp); err != nil {
+					return
+				}
+				if len(chunks) == 0 {
+					allDropped = true
+					return
+				}
+				offset, err = p.persistChunks(fp, chunks)
+				return
+			}
 			if err != nil {
 				return
 			}
-			if !lt.Before(beforeTime) {
+			if numDropped == 0 {
+				firstTimeInFile = cd.chunkFirstTime
+			}
+			if !cd.chunkLastTime.Before(beforeTime) {
 				break
 			}
 		}
-		if i < len(chunks) {
-			firstTimeNotDropped = chunks[i].firstTime()
-		}
-		if i > 0 || firstTimeNotDropped.Before(beforeTime) {
-			// Series file has to go.
-			if numDropped, err = p.deleteSeriesFile(fp); err != nil {
-				return
+
+		// We've found the first chunk that should be kept.
+		// First check if the shrink ratio is good enough to perform the the
+		// actual drop or leave it for next time if it is not worth the effort.
+		totalChunks := int(f.Len())/chunkLenWithHeader + len(chunks)
+		if numDropped == 0 || float64(numDropped)/float64(totalChunks) < p.minShrinkRatio {
+			// Nothing to drop. Just adjust the return values and append the chunks (if any).
+			numDropped = 0
+			firstTimeNotDropped = firstTimeInFile
+			if len(chunks) > 0 {
+				offset, err = p.persistChunks(fp, chunks)
 			}
-			numDropped += i
-			if i == len(chunks) {
-				allDropped = true
-				return
-			}
-			// Now simply persist what has to be persisted to a new file.
-			_, err = p.persistChunks(fp, chunks[i:])
 			return
 		}
-	}
+		// If we are here, we have to drop some chunks for real. So we need to
+		// record firstTimeNotDropped from the last read header, seek backwards
+		// to the beginning of its header, and start copying everything from
+		// there into a new file. Then append the chunks to the new file.
+		firstTimeNotDropped = cd.chunkFirstTime
+		chunkOps.WithLabelValues(drop).Add(float64(numDropped))
+		fileoffset -= chunkHeaderLen
+		// if _, err = f.Seek(-chunkHeaderLen, os.SEEK_CUR); err != nil { return }
 
-	// If we are here, we have to check the series file itself.
-	f, err := p.openChunkFileForReading(fp)
-	if os.IsNotExist(err) {
-		// No series file. Only need to create new file with chunks to
-		// persist, if there are any.
-		if len(chunks) == 0 {
-			allDropped = true
-			err = nil // Do not report not-exist err.
-			return
-		}
-		offset, err = p.persistChunks(fp, chunks)
-		return
-	}
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	headerBuf := make([]byte, chunkHeaderLen)
-	var firstTimeInFile model.Time
-	// Find the first chunk in the file that should be kept.
-	for ; ; numDropped++ {
-		_, err = f.Seek(offsetForChunkIndex(numDropped), os.SEEK_SET)
+		temp, err := os.OpenFile(p.tempFileNameForFingerprint(fp), os.O_WRONLY|os.O_CREATE, 0640)
 		if err != nil {
 			return
 		}
-		_, err = io.ReadFull(f, headerBuf)
-		if err == io.EOF {
-			// Close the file before trying to delete it. This is necessary on Windows
+		defer func() {
+			// Close the file before trying to rename to it. This is necessary on Windows
 			// (this will cause the defer f.Close to fail, but the error is silently ignored)
 			f.Close()
-			// We ran into the end of the file without finding any chunks that should
-			// be kept. Remove the whole file.
-			if numDropped, err = p.deleteSeriesFile(fp); err != nil {
-				return
+			p.closeChunkFile(temp)
+			if err == nil {
+				err = os.Rename(p.tempFileNameForFingerprint(fp), p.fileNameForFingerprint(fp))
 			}
-			if len(chunks) == 0 {
-				allDropped = true
-				return
-			}
-			offset, err = p.persistChunks(fp, chunks)
-			return
-		}
+		}()
+
+		written, err := io.Copy(temp, &readerAtWrapper{readerAt: f, offset: int(fileoffset)})
 		if err != nil {
 			return
 		}
-		if numDropped == 0 {
-			firstTimeInFile = model.Time(
-				binary.LittleEndian.Uint64(headerBuf[chunkHeaderFirstTimeOffset:]),
-			)
-		}
-		lastTime := model.Time(
-			binary.LittleEndian.Uint64(headerBuf[chunkHeaderLastTimeOffset:]),
-		)
-		if !lastTime.Before(beforeTime) {
-			break
-		}
-	}
+		offset = int(written / chunkLenWithHeader)
 
-	// We've found the first chunk that should be kept.
-	// First check if the shrink ratio is good enough to perform the the
-	// actual drop or leave it for next time if it is not worth the effort.
-	fi, err := f.Stat()
-	if err != nil {
-		return
-	}
-	totalChunks := int(fi.Size())/chunkLenWithHeader + len(chunks)
-	if numDropped == 0 || float64(numDropped)/float64(totalChunks) < p.minShrinkRatio {
-		// Nothing to drop. Just adjust the return values and append the chunks (if any).
-		numDropped = 0
-		firstTimeNotDropped = firstTimeInFile
 		if len(chunks) > 0 {
-			offset, err = p.persistChunks(fp, chunks)
+			if err = p.writeChunks(temp, chunks); err != nil {
+				return
+			}
 		}
 		return
-	}
-	// If we are here, we have to drop some chunks for real. So we need to
-	// record firstTimeNotDropped from the last read header, seek backwards
-	// to the beginning of its header, and start copying everything from
-	// there into a new file. Then append the chunks to the new file.
-	firstTimeNotDropped = model.Time(
-		binary.LittleEndian.Uint64(headerBuf[chunkHeaderFirstTimeOffset:]),
-	)
-	chunkOps.WithLabelValues(drop).Add(float64(numDropped))
-	_, err = f.Seek(-chunkHeaderLen, os.SEEK_CUR)
-	if err != nil {
-		return
-	}
-
-	temp, err := os.OpenFile(p.tempFileNameForFingerprint(fp), os.O_WRONLY|os.O_CREATE, 0640)
-	if err != nil {
-		return
-	}
-	defer func() {
-		// Close the file before trying to rename to it. This is necessary on Windows
-		// (this will cause the defer f.Close to fail, but the error is silently ignored)
-		f.Close()
-		p.closeChunkFile(temp)
-		if err == nil {
-			err = os.Rename(p.tempFileNameForFingerprint(fp), p.fileNameForFingerprint(fp))
-		}
-	}()
-
-	written, err := io.Copy(temp, f)
-	if err != nil {
-		return
-	}
-	offset = int(written / chunkLenWithHeader)
-
-	if len(chunks) > 0 {
-		if err = p.writeChunks(temp, chunks); err != nil {
-			return
-		}
-	}
-	return
+	*/
 }
 
 // deleteSeriesFile deletes a series file belonging to the provided
@@ -1002,6 +1267,13 @@ func (p *persistence) unindexMetric(fp model.Fingerprint, m model.Metric) {
 	p.indexingQueue <- indexingOp{fp, m, remove}
 }
 
+// Request extents to store chunks.
+func (p *persistence) chunkIndexFp(fp model.Fingerprint, chunks int) []int {
+	idxchan := make(chan []int)
+	p.chunkIndexingQueue <- chunkIndexingOp{fp, add, chunks, idxchan}
+	return <-idxchan
+}
+
 // waitForIndexing waits until all items in the indexing queue are processed. If
 // queue processing is currently on hold (to gather more ops for batching), this
 // method will trigger an immediate start of processing. This method is
@@ -1010,6 +1282,16 @@ func (p *persistence) waitForIndexing() {
 	wait := make(chan int)
 	for {
 		p.indexingFlush <- wait
+		if <-wait == 0 {
+			break
+		}
+	}
+}
+
+func (p *persistence) waitForChunkIndexing() {
+	wait := make(chan int)
+	for {
+		p.chunkIndexingFlush <- wait
 		if <-wait == 0 {
 			break
 		}
@@ -1147,6 +1429,8 @@ func (p *persistence) unarchiveMetric(fp model.Fingerprint) (deletedAnything boo
 func (p *persistence) close() error {
 	close(p.indexingQueue)
 	<-p.indexingStopped
+	close(p.chunkIndexingQueue)
+	<-p.chunkIndexingStopped
 
 	var lastError, dirtyFileRemoveError error
 	if err := p.archivedFingerprintToMetrics.Close(); err != nil {
@@ -1196,10 +1480,14 @@ func (p *persistence) tempFileNameForFingerprint(fp model.Fingerprint) string {
 }
 
 func (p *persistence) openChunkFileForWriting(fp model.Fingerprint) (*os.File, error) {
-	if err := os.MkdirAll(p.dirNameForFingerprint(fp), 0700); err != nil {
+	chunksPath := filepath.Join(p.basePath, chunksFileName)
+	f, err := os.OpenFile(chunksPath, os.O_WRONLY, 0640)
+	if err != nil {
 		return nil, err
 	}
-	return os.OpenFile(p.fileNameForFingerprint(fp), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0640)
+
+	return f, nil
+
 	// NOTE: Although the file was opened for append,
 	//     f.Seek(0, os.SEEK_CUR)
 	// would now return '0, nil', so we cannot check for a consistent file length right now.
@@ -1211,6 +1499,7 @@ func (p *persistence) openChunkFileForWriting(fp model.Fingerprint) (*os.File, e
 // strategy. Then it closes the file. Errors are logged.
 func (p *persistence) closeChunkFile(f *os.File) {
 	if p.shouldSync() {
+		// TODO(ncabatoff-later) fdatasync the region
 		if err := f.Sync(); err != nil {
 			log.Error("Error syncing file:", err)
 		}
@@ -1220,8 +1509,18 @@ func (p *persistence) closeChunkFile(f *os.File) {
 	}
 }
 
-func (p *persistence) openChunkFileForReading(fp model.Fingerprint) (*os.File, error) {
-	return os.Open(p.fileNameForFingerprint(fp))
+func (p *persistence) openChunkFileForReading(fp model.Fingerprint) (*chunkReader, error) {
+	begin := time.Now()
+	idxs, ok, err := p.fingerprintToChunkIdxs.Lookup(fp)
+	p.chunkIndexingGetDuration.Observe(time.Since(begin).Seconds())
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("error reading chunks for fingeprint %d: not found in index", fp)
+	}
+
+	return newChunkReader(p.chunks, idxs), nil
 }
 
 func (p *persistence) headsFileName() string {
@@ -1238,6 +1537,108 @@ func (p *persistence) mappingsFileName() string {
 
 func (p *persistence) mappingsTempFileName() string {
 	return filepath.Join(p.basePath, mappingsTempFileName)
+}
+
+type reply struct {
+	dest chan []int
+	idxs []int
+}
+
+func (p *persistence) processChunkIndexingQueue() {
+	batchSize := 0
+	fpToChunkIdxs := index.FingerprintChunkIndexMapping{}
+	batchTimeout := time.NewTimer(chunkIndexingBatchTimeout)
+	pendingReplies := make([]reply, 0, indexingMaxBatchSize)
+	defer batchTimeout.Stop()
+
+	commitBatch := func() {
+		p.chunkIndexingBatchSizes.Observe(float64(batchSize))
+		defer func(begin time.Time) {
+			p.chunkIndexingBatchDuration.Observe(time.Since(begin).Seconds())
+		}(time.Now())
+
+		if err := p.fingerprintToChunkIdxs.IndexBatch(fpToChunkIdxs); err != nil {
+			log.Error("Error indexing fp to chunkidxs batch: ", err)
+		}
+		batchSize = 0
+		fpToChunkIdxs = index.FingerprintChunkIndexMapping{}
+		batchTimeout.Reset(chunkIndexingBatchTimeout)
+		for _, r := range pendingReplies {
+			r.dest <- r.idxs
+		}
+		pendingReplies = pendingReplies[:0]
+	}
+
+	var flush chan chan int
+loop:
+	for {
+		// Only process flush requests if the queue is currently empty.
+		if len(p.chunkIndexingQueue) == 0 {
+			flush = p.chunkIndexingFlush
+		} else {
+			flush = nil
+		}
+		select {
+		case <-batchTimeout.C:
+			// Only commit if we have something to commit _and_
+			// nothing is waiting in the queue to be picked up. That
+			// prevents a death spiral if the LookupSet calls below
+			// are slow for some reason.
+			if batchSize > 0 && len(p.chunkIndexingQueue) == 0 {
+				commitBatch()
+			} else {
+				batchTimeout.Reset(chunkIndexingBatchTimeout)
+			}
+		case r := <-flush:
+			if batchSize > 0 {
+				commitBatch()
+			}
+			r <- len(p.chunkIndexingQueue)
+		case op, ok := <-p.chunkIndexingQueue:
+			if !ok {
+				if batchSize > 0 {
+					commitBatch()
+				}
+				break loop
+			}
+
+			batchSize++
+
+			switch op.opType {
+			case add:
+				begin := time.Now()
+				idxs, _, err := p.fingerprintToChunkIdxs.Lookup(op.fingerprint)
+				p.chunkIndexingGetDuration.Observe(time.Since(begin).Seconds())
+				if err != nil {
+					log.Errorf("Error looking up chunks for fp %d: %v", op.fingerprint, err)
+					continue
+				}
+
+				neededChunks := op.numChunks
+				start := len(idxs)
+				for neededChunks > 0 {
+					idx := <-p.extentSource
+					neededChunks -= chunksPerExtent
+					idxs = append(idxs, idx)
+				}
+				fpToChunkIdxs[op.fingerprint] = idxs
+
+				// log.Infof("fp %v needed %d chunks, %v += %v", op.fingerprint, op.numChunks, idxs[:start], idxs[start:])
+
+				// Onus is on the sender to read from done immediately after submitting request.
+				pendingReplies = append(pendingReplies, reply{op.extents, idxs[start:]})
+			case remove:
+				// TODO(ncabatoff-later) handle removal
+			default:
+				panic("unknown op type")
+			}
+
+			if batchSize >= indexingMaxBatchSize {
+				commitBatch()
+			}
+		}
+	}
+	close(p.chunkIndexingStopped)
 }
 
 func (p *persistence) processIndexingQueue() {
@@ -1561,5 +1962,66 @@ func writeChunkHeader(header []byte, c chunk) error {
 		header[chunkHeaderLastTimeOffset:],
 		uint64(lt),
 	)
+	return nil
+}
+
+// DumpChunks writes the metadata of the provided heads file in a human-readable
+// form.
+func DumpChunks(filename string, out io.Writer, startOffset, endOffset int) error {
+	fw, fr, chunkmap, err := getChunksFile(filename)
+	defer func() {
+		chunkmap.Unmap()
+		fr.Close()
+		fw.Close()
+	}()
+
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(out, ">>> Dumping chunks from series file %q\n", filename)
+	m := &globalChunkReader{data: chunkmap}
+	if startOffset < 0 {
+		startOffset = 0
+	}
+	if endOffset < 0 {
+		fi, err := fr.Stat()
+		if err != nil {
+			fmt.Fprintf(out, "Error stating file %q: %v", filename, err)
+			return err
+		}
+		endOffset = int(fi.Size()) / chunkLenWithHeader
+	}
+	var lastEmpty bool
+	for i := startOffset; i < endOffset; i++ {
+		cd, err := loadChunkDesc(m, i)
+		if err != nil {
+			fmt.Fprintf(out, "Error reading chunk desc %d: %v", i, err)
+			break
+		}
+		if cd.chunkFirstTime == model.Time(0) {
+			fmt.Fprint(out, ".")
+			lastEmpty = true
+			continue
+		}
+		if lastEmpty {
+			fmt.Fprintln(out)
+		}
+		lastEmpty = false
+
+		c, err := loadChunk(m, i)
+		if err != nil {
+			fmt.Fprintf(out, "Error reading chunk %d: %v", i, err)
+			break
+		}
+		it := c.newIterator()
+		samples := 0
+		for it.scan() {
+			samples++
+		}
+
+		fmt.Fprintf(out, "%5d from %v to %v with %d samples\n", i, cd.chunkFirstTime.Time(), cd.chunkLastTime.Time(), samples)
+
+	}
 	return nil
 }

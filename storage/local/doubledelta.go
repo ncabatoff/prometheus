@@ -261,8 +261,9 @@ func (c *doubleDeltaEncodedChunk) unmarshal(r io.Reader) error {
 
 // unmarshalFromBuf implements chunk.
 func (c *doubleDeltaEncodedChunk) unmarshalFromBuf(buf []byte) error {
-	*c = (*c)[:cap(*c)]
-	copy(*c, buf)
+	*c = buf
+	// *c = (*c)[:cap(*c)]
+	// copy(*c, buf)
 	l := binary.LittleEndian.Uint16((*c)[doubleDeltaHeaderBufLenOffset:])
 	if int(l) > cap(*c) {
 		return fmt.Errorf("chunk length exceeded during unmarshaling: %d", l)

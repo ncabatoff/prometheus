@@ -802,6 +802,7 @@ func testChunk(t *testing.T, encoding chunkEncoding) {
 	s.WaitForIndexing()
 
 	for m := range s.fpToSeries.iter() {
+		s.maintainMemorySeries(m.fp, model.Earliest)
 		s.fpLocker.Lock(m.fp)
 		defer s.fpLocker.Unlock(m.fp) // TODO remove, see below
 		var values []model.SamplePair

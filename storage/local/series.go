@@ -148,14 +148,14 @@ type memorySeries struct {
 	modTime time.Time
 	// The chunkDescs in memory might not have all the chunkDescs for the
 	// chunks that are persisted to disk. The missing chunkDescs are all
-	// contiguous and at the tail end. chunkDescsOffset is the index of the
-	// chunk on disk that corresponds to the first chunkDesc in memory. If
-	// it is 0, the chunkDescs are all loaded. A value of -1 denotes a
-	// special case: There are chunks on disk, but the offset to the
-	// chunkDescs in memory is unknown. Also, in this special case, there is
-	// no overlap between chunks on disk and chunks in memory (implying that
-	// upon first persisting of a chunk in memory, the offset has to be
-	// set).
+	// contiguous and at the tail end, meaning older than the ones in
+	// memory.  chunkDescsOffset is the index of the chunk on disk that
+	// corresponds to the first chunkDesc in memory. If it is 0, the
+	// chunkDescs are all loaded. A value of -1 denotes a special case:
+	// There are chunks on disk, but the offset to the chunkDescs in memory
+	// is unknown. Also, in this special case, there is no overlap between
+	// chunks on disk and chunks in memory (implying that upon first
+	// persisting of a chunk in memory, the offset has to be set).
 	chunkDescsOffset int
 	// The savedFirstTime field is used as a fallback when the
 	// chunkDescsOffset is not 0. It can be used to save the firstTime of the
@@ -221,16 +221,12 @@ func (s *memorySeries) add(v model.SamplePair) (int, error) {
 		newHead := newChunkDesc(newChunk(), v.Timestamp)
 		s.chunkDescs = append(s.chunkDescs, newHead)
 		s.headChunkClosed = false
-	} else if s.headChunkUsedByIterator && s.head().refCount() > 1 {
+	} else if s.headChunkUsedByIterator {
 		// We only need to clone the head chunk if the current head
-		// chunk was used in an iterator at all and if the refCount is
-		// still greater than the 1 we always have because the head
-		// chunk is not yet persisted. The latter is just an
-		// approximation. We will still clone unnecessarily if an older
+		// chunk was used in an iterator.
+		// We will still clone unnecessarily if an older
 		// iterator using a previous version of the head chunk is still
-		// around and keep the head chunk pinned. We needed to track
-		// pins by version of the head chunk, which is probably not
-		// worth the effort.
+		// around.
 		chunkOps.WithLabelValues(clone).Inc()
 		// No locking needed here because a non-persisted head chunk can
 		// not get evicted concurrently.
@@ -339,39 +335,41 @@ func (s *memorySeries) dropChunks(t model.Time) error {
 
 // preloadChunks is an internal helper method.
 func (s *memorySeries) preloadChunks(
-	indexes []int, fp model.Fingerprint, mss *MemorySeriesStorage,
+	fromIdx, throughIdx int, fp model.Fingerprint, mss *MemorySeriesStorage,
 ) (SeriesIterator, error) {
-	loadIndexes := []int{}
-	pinnedChunkDescs := make([]*chunkDesc, 0, len(indexes))
-	for _, idx := range indexes {
+	chunkDescs := make([]*chunkDesc, 0, throughIdx-fromIdx+1)
+	cutoff := 0
+	// We want to load all the chunks up to the first one that's already in memory.
+	for idx := fromIdx; idx <= throughIdx; idx++ {
 		cd := s.chunkDescs[idx]
-		pinnedChunkDescs = append(pinnedChunkDescs, cd)
-		cd.pin(mss.evictRequests) // Have to pin everything first to prevent immediate eviction on chunk loading.
-		if cd.isEvicted() {
-			loadIndexes = append(loadIndexes, idx)
+		if !cd.isEvicted() {
+			cutoff = len(chunkDescs)
+			// log.Infof("[%v %d] cutoff=%d after checking %s", fp, len(s.chunkDescs), cutoff, cd)
+			break
 		}
+		chunkDescs = append(chunkDescs, cd)
 	}
-	chunkOps.WithLabelValues(pin).Add(float64(len(pinnedChunkDescs)))
+	// We still need to populate in-memory chunkDescs for the eventual query
+	for idx := fromIdx + cutoff; idx <= throughIdx; idx++ {
+		chunkDescs = append(chunkDescs, s.chunkDescs[idx])
+	}
 
-	if len(loadIndexes) > 0 {
+	if cutoff > 0 {
+		// log.Infof("[%v %d] fetching %d from %d", fp, len(s.chunkDescs), cutoff, s.chunkDescsOffset)
 		if s.chunkDescsOffset == -1 {
 			panic("requested loading chunks from persistence in a situation where we must not have persisted data for chunk descriptors in memory")
 		}
-		chunks, err := mss.loadChunks(fp, loadIndexes, s.chunkDescsOffset)
+		chunks, err := mss.loadChunks(fp, s.chunkDescsOffset, s.chunkDescsOffset+cutoff)
 		if err != nil {
-			// Unpin the chunks since we won't return them as pinned chunks now.
-			for _, cd := range pinnedChunkDescs {
-				cd.unpin(mss.evictRequests)
-			}
-			chunkOps.WithLabelValues(unpin).Add(float64(len(pinnedChunkDescs)))
 			return nopIter, err
 		}
 		for i, c := range chunks {
-			s.chunkDescs[loadIndexes[i]].setChunk(c)
+			// log.Infof("[%v %d] updating %s", fp, len(s.chunkDescs), chunkDescs[i])
+			chunkDescs[i].setChunk(c)
 		}
 	}
 
-	if !s.headChunkClosed && indexes[len(indexes)-1] == len(s.chunkDescs)-1 {
+	if !s.headChunkClosed && throughIdx == len(s.chunkDescs)-1 {
 		s.headChunkUsedByIterator = true
 	}
 
@@ -380,7 +378,7 @@ func (s *memorySeries) preloadChunks(
 	}
 
 	iter := &boundedIterator{
-		it:    s.newIterator(pinnedChunkDescs, curriedQuarantineSeries, mss.evictRequests),
+		it:    s.newIterator(chunkDescs, curriedQuarantineSeries),
 		start: model.Now().Add(-mss.dropAfter),
 	}
 
@@ -394,7 +392,6 @@ func (s *memorySeries) preloadChunks(
 func (s *memorySeries) newIterator(
 	pinnedChunkDescs []*chunkDesc,
 	quarantine func(error),
-	evictRequests chan<- evictRequest,
 ) SeriesIterator {
 	chunks := make([]chunk, 0, len(pinnedChunkDescs))
 	for _, cd := range pinnedChunkDescs {
@@ -408,7 +405,6 @@ func (s *memorySeries) newIterator(
 		quarantine:       quarantine,
 		metric:           s.metric,
 		pinnedChunkDescs: pinnedChunkDescs,
-		evictRequests:    evictRequests,
 	}
 }
 
@@ -494,11 +490,8 @@ func (s *memorySeries) preloadChunksForRange(
 		throughIdx--
 	}
 
-	pinIndexes := make([]int, 0, throughIdx-fromIdx+1)
-	for i := fromIdx; i <= throughIdx; i++ {
-		pinIndexes = append(pinIndexes, i)
-	}
-	return s.preloadChunks(pinIndexes, fp, mss)
+	// log.Infof("[%v %d] preloading chunks [%d:%d] for [%s:%s]", fp, len(s.chunkDescs), fromIdx, throughIdx, from, through)
+	return s.preloadChunks(fromIdx, throughIdx, fp, mss)
 }
 
 // head returns a pointer to the head chunk descriptor. The caller must have
@@ -569,8 +562,6 @@ type memorySeriesIterator struct {
 	metric model.Metric
 	// Chunks that were pinned for this iterator.
 	pinnedChunkDescs []*chunkDesc
-	// Where to send evict requests when unpinning pinned chunks.
-	evictRequests chan<- evictRequest
 }
 
 // ValueAtOrBeforeTime implements SeriesIterator.
@@ -666,10 +657,6 @@ func (it *memorySeriesIterator) chunkIterator(i int) chunkIterator {
 }
 
 func (it *memorySeriesIterator) Close() {
-	for _, cd := range it.pinnedChunkDescs {
-		cd.unpin(it.evictRequests)
-	}
-	chunkOps.WithLabelValues(unpin).Add(float64(len(it.pinnedChunkDescs)))
 }
 
 // singleSampleSeriesIterator implements Series Iterator. It is a "shortcut

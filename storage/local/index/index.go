@@ -31,6 +31,7 @@ const (
 	fingerprintTimeRangeDir    = "archived_fingerprint_to_timerange"
 	labelNameToLabelValuesDir  = "labelname_to_labelvalues"
 	labelPairToFingerprintsDir = "labelpair_to_fingerprints"
+	chunkIndexDir              = "fingerprint_to_chunkindexes"
 )
 
 // LevelDB cache sizes, changeable via flags.
@@ -39,6 +40,7 @@ var (
 	FingerprintTimeRangeCacheSize  = 5 * 1024 * 1024
 	LabelNameLabelValuesCacheSize  = 10 * 1024 * 1024
 	LabelPairFingerprintsCacheSize = 20 * 1024 * 1024
+	ChunkIndexCacheSize            = 20 * 1024 * 1024
 )
 
 // FingerprintMetricMapping is an in-memory map of fingerprints to metrics.
@@ -292,5 +294,71 @@ func NewFingerprintTimeRangeIndex(basePath string) (*FingerprintTimeRangeIndex, 
 	}
 	return &FingerprintTimeRangeIndex{
 		KeyValueStore: fingerprintTimeRangeDB,
+	}, nil
+}
+
+// FingerprintChunkIndexMapping is an in-memory map of fingerprints to chunkidxs.
+type FingerprintChunkIndexMapping map[model.Fingerprint][]int
+
+// FingerprintChunkIndex models a database mapping fingerprints to chunkidxs.
+type FingerprintChunkIdxIndex struct {
+	KeyValueStore
+}
+
+// IndexBatch indexes a batch of mappings from fingerprints to metrics.
+//
+// This method is goroutine-safe, but note that no specific order of execution
+// can be guaranteed (especially critical if IndexBatch and UnindexBatch are
+// called concurrently for the same fingerprint).
+func (i *FingerprintChunkIdxIndex) IndexBatch(mapping FingerprintChunkIndexMapping) error {
+	b := i.NewBatch()
+
+	for fp, ci := range mapping {
+		if err := b.Put(codable.Fingerprint(fp), codable.ChunkIndexes(ci)); err != nil {
+			return err
+		}
+	}
+
+	return i.Commit(b)
+}
+
+// UnindexBatch unindexes a batch of mappings from fingerprints to chunkIdxs.
+//
+// This method is goroutine-safe, but note that no specific order of execution
+// can be guaranteed (especially critical if IndexBatch and UnindexBatch are
+// called concurrently for the same fingerprint).
+func (i *FingerprintChunkIdxIndex) UnindexBatch(mapping FingerprintChunkIndexMapping) error {
+	b := i.NewBatch()
+
+	for fp := range mapping {
+		if err := b.Delete(codable.Fingerprint(fp)); err != nil {
+			return err
+		}
+	}
+
+	return i.Commit(b)
+}
+
+// Lookup looks up a metric by fingerprint. Looking up a non-existing
+// fingerprint is not an error. In that case, (nil, false, nil) is returned.
+//
+// This method is goroutine-safe.
+func (i *FingerprintChunkIdxIndex) Lookup(fp model.Fingerprint) (chunkIndex []int, ok bool, err error) {
+	ok, err = i.Get(codable.Fingerprint(fp), (*codable.ChunkIndexes)(&chunkIndex))
+	return
+}
+
+// NewFingerprintMetricIndex returns a LevelDB-backed FingerprintChunkIdxIndex
+// ready to use.
+func NewFingerprintChunkIdxIndex(basePath string) (*FingerprintChunkIdxIndex, error) {
+	fingerprintToChunkIdxDB, err := NewLevelDB(LevelDBOptions{
+		Path:           filepath.Join(basePath, chunkIndexDir),
+		CacheSizeBytes: ChunkIndexCacheSize,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &FingerprintChunkIdxIndex{
+		KeyValueStore: fingerprintToChunkIdxDB,
 	}, nil
 }

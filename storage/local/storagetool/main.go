@@ -16,6 +16,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/prometheus/storage/local"
@@ -35,6 +36,36 @@ func DumpHeadsCmd(t cli.Term, args ...string) int {
 	return 0
 }
 
+// DumpChunksCmd dumps metadata of a heads.db file.
+func DumpChunksCmd(t cli.Term, args ...string) int {
+	startOffset, endOffset := -1, -1
+	var err error
+	if len(args) > 1 {
+		var i int
+		i, err = strconv.Atoi(args[1])
+		if err == nil {
+			startOffset = i
+		}
+	}
+	if len(args) > 2 && err == nil {
+		var i int
+		i, err = strconv.Atoi(args[2])
+		if err == nil {
+			endOffset = i
+		}
+	}
+
+	if len(args) < 1 || len(args) > 3 || err != nil {
+		t.Infof("usage: storagetool dump-chunks <file> [startOffset [endOffset]]")
+		return 2
+	}
+	if err := local.DumpChunks(args[0], t.Out(), startOffset, endOffset); err != nil {
+		t.Errorf("  FAILED: %s", err)
+		return 1
+	}
+	return 0
+}
+
 // VersionCmd prints the binaries version information.
 func VersionCmd(t cli.Term, _ ...string) int {
 	fmt.Fprintln(os.Stdout, version.Print("storagetool"))
@@ -47,6 +78,11 @@ func main() {
 	app.Register("dump-heads", &cli.Command{
 		Desc: "dump metadata of a heads.db checkpoint file",
 		Run:  DumpHeadsCmd,
+	})
+
+	app.Register("dump-chunks", &cli.Command{
+		Desc: "dump metadata of a series file",
+		Run:  DumpChunksCmd,
 	})
 
 	app.Register("version", &cli.Command{

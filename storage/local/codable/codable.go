@@ -445,3 +445,37 @@ func (tr *TimeRange) UnmarshalBinary(buf []byte) error {
 	tr.Last = model.Time(last)
 	return nil
 }
+
+type ChunkIndexes []int
+
+// MarshalBinary implements encoding.BinaryMarshaler.
+func (ci ChunkIndexes) MarshalBinary() ([]byte, error) {
+	buf := &bytes.Buffer{}
+	if _, err := EncodeUvarint(buf, uint64(len(ci))); err != nil {
+		return nil, err
+	}
+	for _, cindex := range ci {
+		if _, err := EncodeUvarint(buf, uint64(cindex)); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+// UnmarshalBinary implements encoding.BinaryUnmarshaler.
+func (ci *ChunkIndexes) UnmarshalBinary(buf []byte) error {
+	r := bytes.NewReader(buf)
+	slicelen, err := binary.ReadUvarint(r)
+	if err != nil {
+		return err
+	}
+
+	for i := 0; i < int(slicelen); i++ {
+		cindex, err := binary.ReadUvarint(r)
+		if err != nil {
+			return err
+		}
+		*ci = append(*ci, int(cindex))
+	}
+	return nil
+}
