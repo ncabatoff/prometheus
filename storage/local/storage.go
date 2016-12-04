@@ -198,6 +198,7 @@ type MemorySeriesStorageOptions struct {
 	SyncStrategy               SyncStrategy  // Which sync strategy to apply to series files.
 	MinShrinkRatio             float64       // Minimum ratio a series file has to shrink during truncation.
 	NumMutexes                 int           // Number of mutexes used for stochastic fingerprint locking.
+	DoNotPersistChunks         bool          // Overrides many preceding settings, prevents chunk storage.
 }
 
 // NewMemorySeriesStorage returns a newly allocated Storage. Storage.Serve still
@@ -352,7 +353,7 @@ func (s *MemorySeriesStorage) Start() (err error) {
 	}()
 
 	log.Info("Loading series map and head chunks...")
-	s.fpToSeries, s.numChunksToPersist, err = p.loadSeriesMapAndHeads()
+	s.fpToSeries, s.numChunksToPersist, err = p.loadSeriesMapAndHeads(!s.options.DoNotPersistChunks)
 	if err != nil {
 		return err
 	}
@@ -364,9 +365,11 @@ func (s *MemorySeriesStorage) Start() (err error) {
 		return err
 	}
 
-	go s.handleEvictList()
-	go s.handleQuarantine()
-	go s.logThrottling()
+	if !s.options.DoNotPersistChunks {
+		go s.handleEvictList()
+		go s.handleQuarantine()
+		go s.logThrottling()
+	}
 	go s.loop()
 
 	return nil
@@ -380,13 +383,15 @@ func (s *MemorySeriesStorage) Stop() error {
 	close(s.loopStopping)
 	<-s.loopStopped
 
-	log.Info("Stopping series quarantining...")
-	close(s.quarantineStopping)
-	<-s.quarantineStopped
+	if !s.options.DoNotPersistChunks {
+		log.Info("Stopping series quarantining...")
+		close(s.quarantineStopping)
+		<-s.quarantineStopped
 
-	log.Info("Stopping chunk eviction...")
-	close(s.evictStopping)
-	<-s.evictStopped
+		log.Info("Stopping chunk eviction...")
+		close(s.evictStopping)
+		<-s.evictStopped
+	}
 
 	// One final checkpoint of the series map and the head chunks.
 	if err := s.persistence.checkpointSeriesMapAndHeads(s.fpToSeries, s.fpLocker); err != nil {
@@ -925,10 +930,14 @@ func (s *MemorySeriesStorage) getOrCreateSeries(fp model.Fingerprint, m model.Me
 	if !ok {
 		var cds []*chunk.Desc
 		var modTime time.Time
-		unarchived, err := s.persistence.unarchiveMetric(fp)
-		if err != nil {
-			log.Errorf("Error unarchiving fingerprint %v (metric %v): %v", fp, m, err)
-			return nil, err
+		var unarchived bool
+		var err error
+		if !s.options.DoNotPersistChunks {
+			unarchived, err = s.persistence.unarchiveMetric(fp)
+			if err != nil {
+				log.Errorf("Error unarchiving fingerprint %v (metric %v): %v", fp, m, err)
+				return nil, err
+			}
 		}
 		if unarchived {
 			s.seriesOps.WithLabelValues(unarchive).Inc()
@@ -948,7 +957,7 @@ func (s *MemorySeriesStorage) getOrCreateSeries(fp model.Fingerprint, m model.Me
 			s.persistence.indexMetric(fp, m)
 			s.seriesOps.WithLabelValues(create).Inc()
 		}
-		series, err = newMemorySeries(m, cds, modTime)
+		series, err = newMemorySeries(m, cds, modTime, !s.options.DoNotPersistChunks)
 		if err != nil {
 			s.quarantineSeries(fp, m, err)
 			return nil, err
@@ -1239,7 +1248,10 @@ func (s *MemorySeriesStorage) loop() {
 	}()
 
 	memoryFingerprints := s.cycleThroughMemoryFingerprints()
-	archivedFingerprints := s.cycleThroughArchivedFingerprints()
+	var archivedFingerprints chan model.Fingerprint
+	if !s.options.DoNotPersistChunks {
+		archivedFingerprints = s.cycleThroughArchivedFingerprints()
+	}
 
 loop:
 	for {
@@ -1282,7 +1294,10 @@ loop:
 	// Wait until both channels are closed.
 	for range memoryFingerprints {
 	}
-	for range archivedFingerprints {
+
+	if !s.options.DoNotPersistChunks {
+		for range archivedFingerprints {
+		}
 	}
 }
 
@@ -1336,6 +1351,14 @@ func (s *MemorySeriesStorage) maintainMemorySeries(
 	}
 
 	defer s.seriesOps.WithLabelValues(memoryMaintenance).Inc()
+
+	if s.options.DoNotPersistChunks {
+		if series.lastTime < model.Now().Add(-s.dropAfter) {
+			s.fpToSeries.del(fp)
+			s.numSeries.Dec()
+		}
+		return false
+	}
 
 	if series.maybeCloseHeadChunk() {
 		s.incNumChunksToPersist(1)

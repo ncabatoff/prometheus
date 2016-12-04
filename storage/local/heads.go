@@ -28,11 +28,12 @@ import (
 )
 
 const (
-	headsFileName            = "heads.db"
-	headsTempFileName        = "heads.db.tmp"
-	headsFormatVersion       = 2
-	headsFormatLegacyVersion = 1 // Can read, but will never write.
-	headsMagicString         = "PrometheusHeads"
+	headsFileName             = "heads.db"
+	headsTempFileName         = "heads.db.tmp"
+	headsFormatVersion        = 3
+	headsFormatLegacyVersion2 = 2 // Can read, but will never write.
+	headsFormatLegacyVersion1 = 1 // Can read, but will never write.
+	headsMagicString          = "PrometheusHeads"
 )
 
 // headsScanner is a scanner to read time series with their heads from a
@@ -48,10 +49,11 @@ type headsScanner struct {
 	seriesCurrent        uint64
 	chunksToPersistTotal int64 // Read after scan() has returned false.
 	err                  error // Read after scan() has returned false.
+	allowZeroChunks      bool
 }
 
-func newHeadsScanner(filename string) *headsScanner {
-	hs := &headsScanner{}
+func newHeadsScanner(filename string, allowZeroChunks bool) *headsScanner {
+	hs := &headsScanner{allowZeroChunks: allowZeroChunks}
 	defer func() {
 		if hs.f != nil && hs.err != nil {
 			hs.f.Close()
@@ -76,7 +78,9 @@ func newHeadsScanner(filename string) *headsScanner {
 		return hs
 	}
 	hs.version, hs.err = binary.ReadVarint(hs.r)
-	if (hs.version != headsFormatVersion && hs.version != headsFormatLegacyVersion) || hs.err != nil {
+	readableVersion := hs.version == headsFormatVersion || hs.version == headsFormatLegacyVersion1 ||
+		hs.version == headsFormatLegacyVersion2
+	if !readableVersion || hs.err != nil {
 		hs.err = fmt.Errorf(
 			"unknown or unreadable heads format version, want %d, got %d, error: %s",
 			headsFormatVersion, hs.version, hs.err,
@@ -110,6 +114,7 @@ func (hs *headsScanner) scan() bool {
 		encoding         byte
 		ch               chunk.Chunk
 		lastTimeHead     model.Time
+		lastSampleValue  float64
 	)
 	if seriesFlags, hs.err = hs.r.ReadByte(); hs.err != nil {
 		return false
@@ -123,7 +128,7 @@ func (hs *headsScanner) scan() bool {
 	if hs.err = metric.UnmarshalFromReader(hs.r); hs.err != nil {
 		return false
 	}
-	if hs.version != headsFormatLegacyVersion {
+	if hs.version != headsFormatLegacyVersion1 {
 		// persistWatermark only present in v2.
 		persistWatermark, hs.err = binary.ReadVarint(hs.r)
 		if hs.err != nil {
@@ -143,12 +148,18 @@ func (hs *headsScanner) scan() bool {
 	if savedFirstTime, hs.err = binary.ReadVarint(hs.r); hs.err != nil {
 		return false
 	}
+	if hs.version == headsFormatVersion {
+		lastSampleValue, hs.err = codable.DecodeFloat64(hs.r)
+		if hs.err != nil {
+			return false
+		}
+	}
 
 	if numChunkDescs, hs.err = binary.ReadVarint(hs.r); hs.err != nil {
 		return false
 	}
 	chunkDescs := make([]*chunk.Desc, numChunkDescs)
-	if hs.version == headsFormatLegacyVersion {
+	if hs.version == headsFormatLegacyVersion1 {
 		if headChunkPersisted {
 			persistWatermark = numChunkDescs
 		} else {
@@ -194,19 +205,23 @@ func (hs *headsScanner) scan() bool {
 		}
 	}
 
-	if lastTimeHead, hs.err = chunkDescs[len(chunkDescs)-1].LastTime(); hs.err != nil {
+	if numChunkDescs == 0 && hs.allowZeroChunks {
+		lastTimeHead = model.Time(savedFirstTime)
+	} else if lastTimeHead, hs.err = chunkDescs[len(chunkDescs)-1].LastTime(); hs.err != nil {
 		return false
 	}
 
 	hs.series = &memorySeries{
-		metric:           model.Metric(metric),
-		chunkDescs:       chunkDescs,
-		persistWatermark: int(persistWatermark),
-		modTime:          modTime,
-		chunkDescsOffset: int(chunkDescsOffset),
-		savedFirstTime:   model.Time(savedFirstTime),
-		lastTime:         lastTimeHead,
-		headChunkClosed:  headChunkClosed,
+		metric:             model.Metric(metric),
+		chunkDescs:         chunkDescs,
+		persistWatermark:   int(persistWatermark),
+		modTime:            modTime,
+		chunkDescsOffset:   int(chunkDescsOffset),
+		savedFirstTime:     model.Time(savedFirstTime),
+		lastTime:           lastTimeHead,
+		headChunkClosed:    headChunkClosed,
+		lastSampleValue:    model.SampleValue(lastSampleValue),
+		lastSampleValueSet: hs.version == headsFormatVersion,
 	}
 	hs.seriesCurrent++
 	return true
@@ -222,7 +237,7 @@ func (hs *headsScanner) close() {
 // DumpHeads writes the metadata of the provided heads file in a human-readable
 // form.
 func DumpHeads(filename string, out io.Writer) error {
-	hs := newHeadsScanner(filename)
+	hs := newHeadsScanner(filename, true)
 	defer hs.close()
 
 	if hs.err == nil {
@@ -236,8 +251,8 @@ func DumpHeads(filename string, out io.Writer) error {
 		s := hs.series
 		fmt.Fprintf(
 			out,
-			"FP=%v\tMETRIC=%s\tlen(chunkDescs)=%d\tpersistWatermark=%d\tchunkDescOffset=%d\tsavedFirstTime=%v\tlastTime=%v\theadChunkClosed=%t\n",
-			hs.fp, s.metric, len(s.chunkDescs), s.persistWatermark, s.chunkDescsOffset, s.savedFirstTime, s.lastTime, s.headChunkClosed,
+			"FP=%v\tMETRIC=%s\tlen(chunkDescs)=%d\tpersistWatermark=%d\tchunkDescOffset=%d\tsavedFirstTime=%v\tlastTime=%v\theadChunkClosed=%t\tlastSampleValue=%.2f\n",
+			hs.fp, s.metric, len(s.chunkDescs), s.persistWatermark, s.chunkDescsOffset, s.savedFirstTime, s.lastTime, s.headChunkClosed, s.lastSampleValue,
 		)
 	}
 	if hs.err == nil {

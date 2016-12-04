@@ -177,7 +177,7 @@ func init() {
 	)
 	cfg.fs.StringVar(
 		&cfg.localStorageEngine, "storage.local.engine", "persisted",
-		"Local storage engine. Supported values are: 'persisted' (full local storage with on-disk persistence) and 'none' (no local storage).",
+		"Local storage engine. Supported values are: 'persisted' (full local storage with on-disk persistence), 'federated' (no chunk storage, only last sample for each metric), and 'none' (no local storage).",
 	)
 
 	// Remote storage.

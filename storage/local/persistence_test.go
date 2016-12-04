@@ -457,11 +457,11 @@ func testCheckpointAndLoadSeriesMapAndHeads(t *testing.T, encoding chunk.Encodin
 
 	fpLocker := newFingerprintLocker(10)
 	sm := newSeriesMap()
-	s1, _ := newMemorySeries(m1, nil, time.Time{})
-	s2, _ := newMemorySeries(m2, nil, time.Time{})
-	s3, _ := newMemorySeries(m3, nil, time.Time{})
-	s4, _ := newMemorySeries(m4, nil, time.Time{})
-	s5, _ := newMemorySeries(m5, nil, time.Time{})
+	s1, _ := newMemorySeries(m1, nil, time.Time{}, true)
+	s2, _ := newMemorySeries(m2, nil, time.Time{}, true)
+	s3, _ := newMemorySeries(m3, nil, time.Time{}, true)
+	s4, _ := newMemorySeries(m4, nil, time.Time{}, true)
+	s5, _ := newMemorySeries(m5, nil, time.Time{}, true)
 	s1.add(model.SamplePair{Timestamp: 1, Value: 3.14})
 	s3.add(model.SamplePair{Timestamp: 2, Value: 2.7})
 	s3.headChunkClosed = true
@@ -489,7 +489,7 @@ func testCheckpointAndLoadSeriesMapAndHeads(t *testing.T, encoding chunk.Encodin
 		t.Fatal(err)
 	}
 
-	loadedSM, _, err := p.loadSeriesMapAndHeads()
+	loadedSM, _, err := p.loadSeriesMapAndHeads(false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,6 +508,9 @@ func testCheckpointAndLoadSeriesMapAndHeads(t *testing.T, encoding chunk.Encodin
 		}
 		if loadedS1.headChunkClosed {
 			t.Error("headChunkClosed is true")
+		}
+		if loadedS1.lastSampleValue != s1.lastSampleValue {
+			t.Errorf("want lastSampleValue=%f, got %f", s1.lastSampleValue, loadedS1.lastSampleValue)
 		}
 		if loadedS1.head().ChunkFirstTime != 1 {
 			t.Errorf("want ChunkFirstTime in head chunk to be 1, got %d", loadedS1.head().ChunkFirstTime)
@@ -530,6 +533,9 @@ func testCheckpointAndLoadSeriesMapAndHeads(t *testing.T, encoding chunk.Encodin
 		}
 		if !loadedS3.headChunkClosed {
 			t.Error("headChunkClosed is false")
+		}
+		if loadedS3.lastSampleValue != s3.lastSampleValue {
+			t.Errorf("want lastSampleValue=%f, got %f", s3.lastSampleValue, loadedS3.lastSampleValue)
 		}
 		if loadedS3.head().ChunkFirstTime != 2 {
 			t.Errorf("want ChunkFirstTime in head chunk to be 2, got %d", loadedS3.head().ChunkFirstTime)
@@ -558,6 +564,9 @@ func testCheckpointAndLoadSeriesMapAndHeads(t *testing.T, encoding chunk.Encodin
 		}
 		if loadedS4.chunkDescsOffset != 0 {
 			t.Errorf("want chunkDescsOffset 0, got %d", loadedS4.chunkDescsOffset)
+		}
+		if loadedS4.lastSampleValue != s4.lastSampleValue {
+			t.Errorf("want lastSampleValue=%f, got %f", s4.lastSampleValue, loadedS4.lastSampleValue)
 		}
 		if loadedS4.headChunkClosed {
 			t.Error("headChunkClosed is true")
@@ -608,6 +617,9 @@ func testCheckpointAndLoadSeriesMapAndHeads(t *testing.T, encoding chunk.Encodin
 		}
 		if loadedS5.chunkDescsOffset != 0 {
 			t.Errorf("want chunkDescsOffset 0, got %d", loadedS5.chunkDescsOffset)
+		}
+		if loadedS5.lastSampleValue != s5.lastSampleValue {
+			t.Errorf("want lastSampleValue=%f, got %f", s5.lastSampleValue, loadedS5.lastSampleValue)
 		}
 		if loadedS5.headChunkClosed {
 			t.Error("headChunkClosed is true")

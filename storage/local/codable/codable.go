@@ -35,6 +35,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 
 	"github.com/prometheus/common/model"
@@ -118,6 +119,20 @@ func DecodeUint64(r io.Reader) (uint64, error) {
 		return 0, err
 	}
 	return binary.BigEndian.Uint64(buf), nil
+}
+
+// EncodeFloat64 writes a float64 to an io.Writer in big-endian byte-order.
+func EncodeFloat64(w io.Writer, f float64) error {
+	return EncodeUint64(w, math.Float64bits(f))
+}
+
+// DecodeFloat64 reads a float64 from an io.Readr in big-endian byte-order.
+func DecodeFloat64(r io.Reader) (float64, error) {
+	u, err := DecodeUint64(r)
+	if err != nil {
+		return 0, err
+	}
+	return math.Float64frombits(u), nil
 }
 
 // encodeString writes the varint encoded length followed by the bytes of s to

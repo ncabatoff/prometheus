@@ -87,6 +87,10 @@ func Main() int {
 	case "persisted":
 		localStorage = local.NewMemorySeriesStorage(&cfg.storage)
 		sampleAppender = storage.Fanout{localStorage}
+	case "federated":
+		cfg.storage.DoNotPersistChunks = true
+		localStorage = local.NewMemorySeriesStorage(&cfg.storage)
+		sampleAppender = storage.Fanout{localStorage}
 	case "none":
 		localStorage = &local.NoopStorage{}
 	default:

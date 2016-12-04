@@ -21,7 +21,7 @@ import (
 )
 
 func TestDropChunks(t *testing.T) {
-	s, err := newMemorySeries(nil, nil, time.Time{})
+	s, err := newMemorySeries(nil, nil, time.Time{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}

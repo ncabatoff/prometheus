@@ -185,6 +185,9 @@ type memorySeries struct {
 	// Whether the series is inconsistent with the last checkpoint in a way
 	// that would require a disk seek during crash recovery.
 	dirty bool
+
+	// Whether the series should persist chunks.
+	persistChunks bool
 }
 
 // newMemorySeries returns a pointer to a newly allocated memorySeries for the
@@ -195,7 +198,7 @@ type memorySeries struct {
 // set to model.Earliest. The zero value for modTime can be used if the
 // modification time of the series file is unknown (e.g. if this is a genuinely
 // new series).
-func newMemorySeries(m model.Metric, chunkDescs []*chunk.Desc, modTime time.Time) (*memorySeries, error) {
+func newMemorySeries(m model.Metric, chunkDescs []*chunk.Desc, modTime time.Time, persistChunks bool) (*memorySeries, error) {
 	var err error
 	firstTime := model.Earliest
 	lastTime := model.Earliest
@@ -213,6 +216,7 @@ func newMemorySeries(m model.Metric, chunkDescs []*chunk.Desc, modTime time.Time
 		lastTime:         lastTime,
 		persistWatermark: len(chunkDescs),
 		modTime:          modTime,
+		persistChunks:    persistChunks,
 	}, nil
 }
 
@@ -221,6 +225,14 @@ func newMemorySeries(m model.Metric, chunkDescs []*chunk.Desc, modTime time.Time
 //
 // The caller must have locked the fingerprint of the series.
 func (s *memorySeries) add(v model.SamplePair) (int, error) {
+	if !s.persistChunks {
+		s.lastTime = v.Timestamp
+		s.lastSampleValue = v.Value
+		s.savedFirstTime = v.Timestamp
+		s.lastSampleValueSet = true
+		return 0, nil
+	}
+
 	if len(s.chunkDescs) == 0 || s.headChunkClosed {
 		newHead := chunk.NewDesc(chunk.New(), v.Timestamp)
 		s.chunkDescs = append(s.chunkDescs, newHead)

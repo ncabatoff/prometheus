@@ -532,18 +532,20 @@ func (p *persistence) loadChunkDescs(fp model.Fingerprint, offsetFromEnd int) ([
 //
 // (4.6) The varint-encoded savedFirstTime.
 //
-// (4.7) The varint-encoded number of chunk descriptors.
+// (4.7) The lastSample value as big-endian float64. (Missing in v1,v2.)
 //
-// (4.8) Repeated once per chunk descriptor, oldest to most recent, either
-// variant 4.8.1 (if index < persistWatermark) or variant 4.8.2 (if index >=
-// persistWatermark). In v1, everything is variant 4.8.1 except for a
+// (4.8) The varint-encoded number of chunk descriptors.
+//
+// (4.9) Repeated once per chunk descriptor, oldest to most recent, either
+// variant 4.9.1 (if index < persistWatermark) or variant 4.9.2 (if index >=
+// persistWatermark). In v1, everything is variant 4.9.1 except for a
 // non-persisted head-chunk (determined by the flags).
 //
-// (4.8.1.1) The varint-encoded first time.
-// (4.8.1.2) The varint-encoded last time.
+// (4.9.1.1) The varint-encoded first time.
+// (4.9.1.2) The varint-encoded last time.
 //
-// (4.8.2.1) A byte defining the chunk type.
-// (4.8.2.2) The chunk itself, marshaled with the Marshal() method.
+// (4.9.2.1) A byte defining the chunk type.
+// (4.9.2.2) The chunk itself, marshaled with the Marshal() method.
 //
 func (p *persistence) checkpointSeriesMapAndHeads(fingerprintToSeries *seriesMap, fpLocker *fingerprintLocker) (err error) {
 	log.Info("Checkpointing in-memory metrics and chunks...")
@@ -603,7 +605,7 @@ func (p *persistence) checkpointSeriesMapAndHeads(fingerprintToSeries *seriesMap
 			fpLocker.Lock(m.fp)
 			defer fpLocker.Unlock(m.fp)
 
-			if len(m.series.chunkDescs) == 0 {
+			if len(m.series.chunkDescs) == 0 && m.series.persistChunks {
 				// This series was completely purged or archived in the meantime. Ignore.
 				return
 			}
@@ -639,6 +641,9 @@ func (p *persistence) checkpointSeriesMapAndHeads(fingerprintToSeries *seriesMap
 				return
 			}
 			if _, err = codable.EncodeVarint(w, int64(m.series.savedFirstTime)); err != nil {
+				return
+			}
+			if err = codable.EncodeFloat64(w, float64(m.series.lastSampleValue)); err != nil {
 				return
 			}
 			if _, err = codable.EncodeVarint(w, int64(len(m.series.chunkDescs))); err != nil {
@@ -703,7 +708,7 @@ func (p *persistence) checkpointSeriesMapAndHeads(fingerprintToSeries *seriesMap
 // unrecoverable error is encountered, it is returned. Call this method during
 // start-up while nothing else is running in storage land. This method is
 // utterly goroutine-unsafe.
-func (p *persistence) loadSeriesMapAndHeads() (sm *seriesMap, chunksToPersist int64, err error) {
+func (p *persistence) loadSeriesMapAndHeads(ignoreSeriesFiles bool) (sm *seriesMap, chunksToPersist int64, err error) {
 	fingerprintToSeries := make(map[model.Fingerprint]*memorySeries)
 	sm = &seriesMap{m: fingerprintToSeries}
 
@@ -711,7 +716,7 @@ func (p *persistence) loadSeriesMapAndHeads() (sm *seriesMap, chunksToPersist in
 		if p.dirty {
 			log.Warn("Persistence layer appears dirty.")
 			p.startedDirty.Set(1)
-			err = p.recoverFromCrash(fingerprintToSeries)
+			err = p.recoverFromCrash(fingerprintToSeries, ignoreSeriesFiles)
 			if err != nil {
 				sm = nil
 			}
@@ -720,7 +725,7 @@ func (p *persistence) loadSeriesMapAndHeads() (sm *seriesMap, chunksToPersist in
 		}
 	}()
 
-	hs := newHeadsScanner(p.headsFileName())
+	hs := newHeadsScanner(p.headsFileName(), true)
 	defer hs.close()
 	for hs.scan() {
 		fingerprintToSeries[hs.fp] = hs.series

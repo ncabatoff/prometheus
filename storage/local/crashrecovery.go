@@ -35,7 +35,10 @@ import (
 // an error or because the persistence was dirty from the start). Not goroutine
 // safe. Only call before anything else is running (except index processing
 // queue as started by newPersistence).
-func (p *persistence) recoverFromCrash(fingerprintToSeries map[model.Fingerprint]*memorySeries) error {
+func (p *persistence) recoverFromCrash(
+	fingerprintToSeries map[model.Fingerprint]*memorySeries,
+	ignoreSeriesFiles bool,
+) error {
 	// TODO(beorn): We need proper tests for the crash recovery.
 	log.Warn("Starting crash recovery. Prometheus is inoperational until complete.")
 	log.Warn("To avoid crash recovery in the future, shut down Prometheus with SIGTERM or a HTTP POST to /-/quit.")
@@ -52,85 +55,87 @@ func (p *persistence) recoverFromCrash(fingerprintToSeries map[model.Fingerprint
 	// The mappings to rebuild.
 	fpm := fpMappings{}
 
-	log.Info("Scanning files.")
-	for i := 0; i < 1<<(seriesDirNameLen*4); i++ {
-		dirname := filepath.Join(p.basePath, fmt.Sprintf(seriesDirNameFmt, i))
-		dir, err := os.Open(dirname)
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		for fis := []os.FileInfo{}; err != io.EOF; fis, err = dir.Readdir(1024) {
-			if err != nil {
-				dir.Close()
-				return err
-			}
-			for _, fi := range fis {
-				fp, ok := p.sanitizeSeries(dirname, fi, fingerprintToSeries, fpm)
-				if ok {
-					fpsSeen[fp] = struct{}{}
-				}
-				count++
-				if count%10000 == 0 {
-					log.Infof("%d files scanned.", count)
-				}
-			}
-		}
-		dir.Close()
-	}
-	log.Infof("File scan complete. %d series found.", len(fpsSeen))
-
-	log.Info("Checking for series without series file.")
-	for fp, s := range fingerprintToSeries {
-		if _, seen := fpsSeen[fp]; !seen {
-			// fp exists in fingerprintToSeries, but has no representation on disk.
-			if s.persistWatermark == len(s.chunkDescs) {
-				// Oops, everything including the head chunk was
-				// already persisted, but nothing on disk.
-				// Thus, we lost that series completely. Clean
-				// up the remnants.
-				delete(fingerprintToSeries, fp)
-				if err := p.purgeArchivedMetric(fp); err != nil {
-					// Purging the archived metric didn't work, so try
-					// to unindex it, just in case it's in the indexes.
-					p.unindexMetric(fp, s.metric)
-				}
-				log.Warnf("Lost series detected: fingerprint %v, metric %v.", fp, s.metric)
+	if !ignoreSeriesFiles {
+		log.Info("Scanning files.")
+		for i := 0; i < 1<<(seriesDirNameLen*4); i++ {
+			dirname := filepath.Join(p.basePath, fmt.Sprintf(seriesDirNameFmt, i))
+			dir, err := os.Open(dirname)
+			if os.IsNotExist(err) {
 				continue
 			}
-			// If we are here, the only chunks we have are the chunks in the checkpoint.
-			// Adjust things accordingly.
-			if s.persistWatermark > 0 || s.chunkDescsOffset != 0 {
-				minLostChunks := s.persistWatermark + s.chunkDescsOffset
-				if minLostChunks <= 0 {
-					log.Warnf(
-						"Possible loss of chunks for fingerprint %v, metric %v.",
-						fp, s.metric,
-					)
-				} else {
-					log.Warnf(
-						"Lost at least %d chunks for fingerprint %v, metric %v.",
-						minLostChunks, fp, s.metric,
-					)
-				}
-				s.chunkDescs = append(
-					make([]*chunk.Desc, 0, len(s.chunkDescs)-s.persistWatermark),
-					s.chunkDescs[s.persistWatermark:]...,
-				)
-				chunk.NumMemDescs.Sub(float64(s.persistWatermark))
-				s.persistWatermark = 0
-				s.chunkDescsOffset = 0
+			if err != nil {
+				return err
 			}
-			maybeAddMapping(fp, s.metric, fpm)
-			fpsSeen[fp] = struct{}{} // Add so that fpsSeen is complete.
+			for fis := []os.FileInfo{}; err != io.EOF; fis, err = dir.Readdir(1024) {
+				if err != nil {
+					dir.Close()
+					return err
+				}
+				for _, fi := range fis {
+					fp, ok := p.sanitizeSeries(dirname, fi, fingerprintToSeries, fpm)
+					if ok {
+						fpsSeen[fp] = struct{}{}
+					}
+					count++
+					if count%10000 == 0 {
+						log.Infof("%d files scanned.", count)
+					}
+				}
+			}
+			dir.Close()
 		}
-	}
-	log.Info("Check for series without series file complete.")
+		log.Infof("File scan complete. %d series found.", len(fpsSeen))
 
-	if err := p.cleanUpArchiveIndexes(fingerprintToSeries, fpsSeen, fpm); err != nil {
-		return err
+		log.Info("Checking for series without series file.")
+		for fp, s := range fingerprintToSeries {
+			if _, seen := fpsSeen[fp]; !seen {
+				// fp exists in fingerprintToSeries, but has no representation on disk.
+				if s.persistWatermark == len(s.chunkDescs) {
+					// Oops, everything including the head chunk was
+					// already persisted, but nothing on disk.
+					// Thus, we lost that series completely. Clean
+					// up the remnants.
+					delete(fingerprintToSeries, fp)
+					if err := p.purgeArchivedMetric(fp); err != nil {
+						// Purging the archived metric didn't work, so try
+						// to unindex it, just in case it's in the indexes.
+						p.unindexMetric(fp, s.metric)
+					}
+					log.Warnf("Lost series detected: fingerprint %v, metric %v.", fp, s.metric)
+					continue
+				}
+				// If we are here, the only chunks we have are the chunks in the checkpoint.
+				// Adjust things accordingly.
+				if s.persistWatermark > 0 || s.chunkDescsOffset != 0 {
+					minLostChunks := s.persistWatermark + s.chunkDescsOffset
+					if minLostChunks <= 0 {
+						log.Warnf(
+							"Possible loss of chunks for fingerprint %v, metric %v.",
+							fp, s.metric,
+						)
+					} else {
+						log.Warnf(
+							"Lost at least %d chunks for fingerprint %v, metric %v.",
+							minLostChunks, fp, s.metric,
+						)
+					}
+					s.chunkDescs = append(
+						make([]*chunk.Desc, 0, len(s.chunkDescs)-s.persistWatermark),
+						s.chunkDescs[s.persistWatermark:]...,
+					)
+					chunk.NumMemDescs.Sub(float64(s.persistWatermark))
+					s.persistWatermark = 0
+					s.chunkDescsOffset = 0
+				}
+				maybeAddMapping(fp, s.metric, fpm)
+				fpsSeen[fp] = struct{}{} // Add so that fpsSeen is complete.
+			}
+		}
+		log.Info("Check for series without series file complete.")
+
+		if err := p.cleanUpArchiveIndexes(fingerprintToSeries, fpsSeen, fpm); err != nil {
+			return err
+		}
 	}
 	if err := p.rebuildLabelIndexes(fingerprintToSeries); err != nil {
 		return err
@@ -453,7 +458,7 @@ func (p *persistence) cleanUpArchiveIndexes(
 		if err != nil {
 			return err
 		}
-		series, err := newMemorySeries(model.Metric(m), cds, p.seriesFileModTime(model.Fingerprint(fp)))
+		series, err := newMemorySeries(model.Metric(m), cds, p.seriesFileModTime(model.Fingerprint(fp)), true)
 		if err != nil {
 			return err
 		}
